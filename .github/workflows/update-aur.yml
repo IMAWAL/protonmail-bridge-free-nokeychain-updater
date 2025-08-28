@@ -66,62 +66,171 @@ jobs:
           echo "GIT_SSH_COMMAND=ssh -i ~/.ssh/aur_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" >> "$GITHUB_ENV"
       
       - name: Clone AUR repo
+        id: clone
+        run: |
+          set -u -o pipefail
+          echo "Using enforced SSH command: $GIT_SSH_COMMAND" >&2
+          attempts=3
+          backoff=5
+          success=0
+          for i in $(seq 1 $attempts); do
+            echo "Clone attempt $i/$attempts" >&2
+            if git clone "$AUR_REPO_SSH" aur-repo 2>clone.err; then
+              success=1
+              break
+            fi
+            echo "Clone attempt $i failed:" >&2
+            tail -n 20 clone.err || true
+            if grep -qiE 'Permission denied|publickey' clone.err; then
+              echo '::error::Authentication failure cloning AUR (likely key / repo mismatch). Not retrying.'
+              break
+            fi
+            if [ $i -lt $attempts ]; then
+              echo "Transient failure (network/outage?). Sleeping ${backoff}s before retry." >&2
+              sleep $backoff
+              backoff=$(( backoff * 2 ))
+            fi
+          done
+          if [ $success -ne 1 ]; then
+            echo '::warning::Unable to clone AUR repo after retries; treating as transient outage and skipping update.'
+            mkdir -p aur-repo
+            echo 'clone_failed' > aur-repo/.clone_failed || true
+            echo "clone_ok=false" >> $GITHUB_OUTPUT
+            # Keep job green
+            exit 0
+          fi
+          echo "Clone succeeded." >&2
+          echo "clone_ok=true" >> $GITHUB_OUTPUT
+
+      - name: Prevent temporary patch from being staged
+        if: steps.clone.outputs.clone_ok == 'true'
         run: |
           set -euo pipefail
-          echo "Using enforced SSH command: $GIT_SSH_COMMAND" >&2
-          # Attempt clone with enforced identity
-          if ! git clone "$AUR_REPO_SSH" aur-repo 2>clone.err; then
-            echo '::error::git clone failed. Showing last 60 lines of verbose SSH probe and clone stderr:'
-            tail -n 60 clone.err || true
-            echo 'Likely causes: (1) Public key NOT uploaded to AUR account; (2) Wrong package repo name; (3) Secret contains wrong private key.'
-            exit 128
+          info_exclude="aur-repo/.git/info/exclude"
+          mkdir -p "$(dirname "$info_exclude")"
+          if ! grep -qxF 'keyfile.patch.new' "$info_exclude" 2>/dev/null; then
+            echo 'keyfile.patch.new' >> "$info_exclude"
+          fi
+
+      - name: Fetch latest keyfile.patch from nokeychain AUR repo
+        if: steps.clone.outputs.clone_ok == 'true'
+        id: fetch_patch
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://aur.archlinux.org/protonmail-bridge-nokeychain.git nokeychain-aur
+          if [ -f nokeychain-aur/keyfile.patch ]; then
+            cp nokeychain-aur/keyfile.patch aur-repo/keyfile.patch.new
+            echo "patch_found=true" >> $GITHUB_OUTPUT
+          else
+            echo "No keyfile.patch found in nokeychain repo." >&2
+            echo "patch_found=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Check upstream for new commit/version
         id: upstream
+        if: steps.clone.outputs.clone_ok == 'true'
         run: |
           set -euo pipefail
           cd aur-repo
           if [ ! -f PKGBUILD ]; then
             echo "PKGBUILD missing in cloned AUR repo" >&2; exit 1; fi
-          current_pkgver=$(grep -E '^pkgver=' PKGBUILD | head -1 | cut -d= -f2- | tr -d ' \t') || current_pkgver=""
-          echo "Current pkgver: $current_pkgver" >&2
-          rm -rf _upstream && git clone --depth=1 "$UPSTREAM_REPO" _upstream >/dev/null 2>&1
+          current_pkgver=$(grep -E '^pkgver=' PKGBUILD | head -1 | cut -d= -f2- | tr -d ' \t' || true)
+          current_pkgrel=$(grep -E '^pkgrel=' PKGBUILD | head -1 | cut -d= -f2- | tr -d ' \t' || true)
+          current_pkgrel=${current_pkgrel:-0}
+          current_commit=$(grep -E '^# upstream_commit=' PKGBUILD | head -1 | sed -E 's/^# upstream_commit=//' || true)
+          echo "Current pkgver: ${current_pkgver:-<none>}" >&2
+          echo "Current pkgrel: ${current_pkgrel}" >&2
+          echo "Current recorded upstream commit: ${current_commit:-<none>}" >&2
+          rm -rf _upstream && git clone --depth=1 "$UPSTREAM_REPO" _upstream >/dev/null 2>&1 || {
+            echo "::error::Failed to clone upstream repo $UPSTREAM_REPO" >&2; exit 1; }
           cd _upstream
-            internal_ver=$(grep -E 'BRIDGE_APP_VERSION\?=' Makefile | sed -E 's/.*= *([^ ]+).*/\1/' || echo unknown)
+            internal_ver=$(grep -E 'BRIDGE_APP_VERSION\?=' Makefile | sed -E 's/.*= *([^ ]+).*/\1/' | head -1 || true)
+            clean_ver="${internal_ver%%+*}"
             git_rev=$(git rev-parse --short HEAD)
-            new_pkgver="${internal_ver%%+*}.r0.g${git_rev}"
-            echo "Latest upstream derived pkgver: $new_pkgver" >&2
+            echo "Upstream internal version: ${internal_ver}" >&2
+            echo "Derived clean version: ${clean_ver}" >&2
+            echo "Latest upstream commit: ${git_rev}" >&2
           cd ..
-          if [ -z "$current_pkgver" ] || [ "$new_pkgver" != "$current_pkgver" ]; then
-            echo "Upstream change detected (or pkgver empty). Updating PKGBUILD..." >&2
-            sed -i -E "s/^pkgver=.*/pkgver=$new_pkgver/" PKGBUILD
-            sed -i -E "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
-            upstream_changed=true
+          upstream_ver_changed=false
+          upstream_commit_changed=false
+          pkgrel_modified=false
+          force_dispatch="${{ github.event.inputs.force || 'false' }}"
+          # 1. Version bump (clean version changed)
+          if [ -z "${current_pkgver}" ] || [ "${clean_ver}" != "${current_pkgver}" ]; then
+            echo "Version change detected (${current_pkgver} -> ${clean_ver}). Resetting pkgrel to 1." >&2
+            sed -i -E "s/^pkgver=.*/pkgver=${clean_ver}/" PKGBUILD
+            if grep -q '^pkgrel=' PKGBUILD; then
+              sed -i -E "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+            else
+              echo 'pkgrel=1' >> PKGBUILD
+            fi
+            upstream_ver_changed=true
+            pkgrel_modified=true
           else
-            upstream_changed=false
+            # 2. Same version, check if commit changed
+            if [ "${git_rev}" != "${current_commit}" ]; then
+              echo "Same upstream version but new commit (${current_commit} -> ${git_rev}). Incrementing pkgrel." >&2
+              new_pkgrel=$(( current_pkgrel + 1 ))
+              sed -i -E "s/^pkgrel=.*/pkgrel=${new_pkgrel}/" PKGBUILD
+              upstream_commit_changed=true
+              pkgrel_modified=true
+            fi
           fi
-          echo "upstream_changed=$upstream_changed" >> $GITHUB_OUTPUT
+          # 3. Patch update or forced run may still require pkgrel increment if not already modified
+          if [ "${pkgrel_modified}" = "false" ]; then
+            if [ "$force_dispatch" = "true" ] || [ -f keyfile.patch.new ]; then
+              echo "Forcing pkgrel increment due to force flag or patch presence." >&2
+              new_pkgrel=$(( current_pkgrel + 1 ))
+              sed -i -E "s/^pkgrel=.*/pkgrel=${new_pkgrel}/" PKGBUILD
+              pkgrel_modified=true
+            fi
+          fi
+          # 4. Record (or update) upstream commit line so future runs can detect commit changes
+          if grep -q '^# upstream_commit=' PKGBUILD; then
+            sed -i -E "s|^# upstream_commit=.*|# upstream_commit=${git_rev}|" PKGBUILD
+          else
+            # Insert after pkgrel= line for clarity
+            if grep -q '^pkgrel=' PKGBUILD; then
+              sed -i -E "/^pkgrel=/a # upstream_commit=${git_rev}" PKGBUILD
+            else
+              echo "# upstream_commit=${git_rev}" >> PKGBUILD
+            fi
+          fi
+          upstream_changed=false
+          if [ "${upstream_ver_changed}" = "true" ] || [ "${upstream_commit_changed}" = "true" ]; then
+            upstream_changed=true
+          fi
+          echo "Upstream version changed: ${upstream_ver_changed}" >&2
+          echo "Upstream commit changed: ${upstream_commit_changed}" >&2
+          echo "pkgrel modified in this step: ${pkgrel_modified}" >&2
+          echo "upstream_changed=${upstream_changed}" >> $GITHUB_OUTPUT
           rm -rf _upstream
           if git diff --quiet; then
             echo "No modifications to commit yet." >&2
             echo "files_changed=false" >> $GITHUB_OUTPUT
           else
-            echo "PKGBUILD updated due to upstream change." >&2
+            echo "PKGBUILD and/or metadata updated." >&2
             echo "files_changed=true" >> $GITHUB_OUTPUT
           fi
 
       - name: Decide if build/push needed
         id: decision
         run: |
+          clone_ok="${{ steps.clone.outputs.clone_ok }}"
+          if [[ "$clone_ok" != "true" ]]; then
+            echo "Clone failed (transient). Skipping remainder without error." >&2
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
           force_dispatch="${{ github.event.inputs.force || 'false' }}"
           changed="${{ steps.upstream.outputs.files_changed }}"
           upstream_changed="${{ steps.upstream.outputs.upstream_changed }}"
+          patch_found="${{ steps.fetch_patch.outputs.patch_found }}"
           if [[ "$force_dispatch" == "true" ]]; then
             echo "Forced run requested." >&2
             echo "proceed=true" >> $GITHUB_OUTPUT
-          elif [[ "$upstream_changed" == "true" || "$changed" == "true" ]]; then
-            echo "Changes detected (upstream: $upstream_changed, files: $changed), will proceed." >&2
+          elif [[ "$upstream_changed" == "true" || "$changed" == "true" || "$patch_found" == "true" ]]; then
+            echo "Changes detected (upstream: $upstream_changed, files: $changed, patch found: $patch_found), will proceed." >&2
             echo "proceed=true" >> $GITHUB_OUTPUT
           else
             echo "No changes and not forced; skipping build/push." >&2
@@ -141,8 +250,10 @@ jobs:
           image: ${{ env.ARCH_CONTAINER }}
           options: -v ${{ github.workspace }}:/workspace -w /workspace
           run: |
+            # Create a temporary file for outputs
+            touch /workspace/github_output
             set -euxo pipefail
-            pacman -Sy --noconfirm git base-devel sudo rsync
+            pacman -Sy --noconfirm git base-devel sudo rsync pacman-contrib
             useradd -m build
             echo 'build ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/build
             su build -c 'mkdir -p /home/build/pkgbuild'
@@ -150,7 +261,18 @@ jobs:
             # Ensure build user owns extracted files so it can generate .SRCINFO and build artifacts
             chown -R build:build /home/build/pkgbuild
             cd /home/build/pkgbuild
-            su build -c 'makepkg --printsrcinfo > .SRCINFO'
+            patch_changed="false"
+            # Check if we need to update keyfile.patch
+            if [ -f keyfile.patch.new ] && { [ ! -f keyfile.patch ] || ! cmp -s keyfile.patch keyfile.patch.new; }; then
+              echo "Updating keyfile.patch" >&2
+              mv keyfile.patch.new keyfile.patch
+              # Update checksums
+              su build -c 'updpkgsums'
+              su build -c 'makepkg --printsrcinfo > .SRCINFO'
+              patch_changed="true"
+              # Create a flag file to indicate changes
+              touch .patch_updated
+            fi
             su build -c 'makepkg -sf --noconfirm'
             pkgfile=( *.pkg.tar.* )
             if [[ -f "${pkgfile[0]}" ]]; then
@@ -163,21 +285,37 @@ jobs:
               rm -rf /workspace/aur-repo/*
               cp -a /home/build/pkgbuild/. /workspace/aur-repo/
             fi
+            # Check if patch was updated and set output accordingly
+            if [ -f /home/build/pkgbuild/.patch_updated ]; then
+              echo "files_changed=true" >> /workspace/github_output
+            fi
 
       - name: Fix ownership after container build
         if: steps.decision.outputs.proceed == 'true'
+        id: post_build
         run: |
           set -euo pipefail
           # Ensure current runner user owns repo so git can write config/index.
           sudo chown -R "$USER":"$USER" aur-repo || true
           # Relax write perms just in case (non-recursive for .git/config only)
           if [ -f aur-repo/.git/config ]; then sudo chmod u+rw aur-repo/.git/config || true; fi
+          # Read and apply any outputs from the container
+          if [ -f github_output ] && grep -q "files_changed=true" github_output; then
+            echo "files_changed=true" >> $GITHUB_OUTPUT
+          fi
+          # Ensure temporary patch file never leaks into commits
+          rm -f aur-repo/keyfile.patch.new
 
       - name: Commit & push to AUR
         if: steps.decision.outputs.proceed == 'true'
         run: |
             set -eu
             cd aur-repo
+            # Remove our temporary flag file if it exists
+            rm -f .patch_updated
+            # Guard against temporary patch file being staged or committed
+            rm -f keyfile.patch.new
+            git rm --cached --ignore-unmatch keyfile.patch.new
             # Mark as safe (in case of uid/gid changes from container operations)
             git config --global --add safe.directory "$(pwd)" || true
             # Normalize permissions if still mismatched
@@ -187,17 +325,39 @@ jobs:
             if git diff --quiet; then
               echo "No diff after build (.SRCINFO may match). Nothing to push."; exit 0
             fi
-            git add .
+            git add -A
             git commit -m "Update packaging (CI run $GITHUB_RUN_NUMBER)" || exit 0
-            git push origin HEAD:master
+            # Add retries for git push
+            max_attempts=3
+            attempt=1
+            while [ $attempt -le $max_attempts ]; do
+              echo "Push attempt $attempt of $max_attempts..."
+              if git push "$AUR_REPO_SSH" HEAD:master; then
+                break
+              fi
+              attempt=$((attempt + 1))
+              if [ $attempt -le $max_attempts ]; then
+                echo "Push failed, waiting 10 seconds before retry..."
+                sleep 10
+              fi
+            done
+            if [ $attempt -gt $max_attempts ]; then
+              echo "Failed to push after $max_attempts attempts"
+              exit 1
+            fi
 
       - name: Summary
         run: |
+          echo "Clone OK: ${{ steps.clone.outputs.clone_ok }}"
           echo "Upstream changed: ${{ steps.upstream.outputs.upstream_changed }}"
           echo "Files changed: ${{ steps.upstream.outputs.files_changed }}"
           echo "Proceed: ${{ steps.decision.outputs.proceed }}"
           if [ "${{ steps.decision.outputs.proceed }}" = 'false' ]; then
-            echo "No updates were necessary." >> $GITHUB_STEP_SUMMARY
+            if [ "${{ steps.clone.outputs.clone_ok }}" != 'true' ]; then
+              echo "AUR clone failed (likely outage). Skipped update without failing workflow." >> $GITHUB_STEP_SUMMARY
+            else
+              echo "No updates were necessary." >> $GITHUB_STEP_SUMMARY
+            fi
           else
             echo "Update attempted (see prior steps for success/push)." >> $GITHUB_STEP_SUMMARY
           fi
