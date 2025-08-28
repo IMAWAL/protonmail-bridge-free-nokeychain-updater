@@ -1,0 +1,204 @@
+name: Update AUR package
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force push even if no diff detected (true/false)'
+        required: false
+        default: 'false'
+  schedule:
+    - cron: '17 */6 * * *'
+
+concurrency:
+  group: aur-update
+  cancel-in-progress: false
+
+env:
+  AUR_REPO_SSH: ssh://aur@aur.archlinux.org/protonmail-bridge-free-nokeychain.git
+  ARCH_CONTAINER: archlinux:base-devel
+  UPSTREAM_REPO: https://github.com/mnixry/proton-bridge.git
+
+jobs:
+  sync-and-build:
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    name: Sync, build, and (if changed) push
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout updater repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add AUR host key & start ssh-agent
+        id: ssh
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          # Write private key from secret (supports multiline). Newlines are preserved inside the quoted expansion.
+          printf '%s\n' "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur_ed25519
+          chmod 600 ~/.ssh/aur_ed25519
+          # Basic validation
+          if ! grep -q 'BEGIN OPENSSH PRIVATE KEY' ~/.ssh/aur_ed25519; then
+            echo '::error::AUR_SSH_PRIVATE_KEY secret does not look like an OpenSSH private key.'
+            sed -n '1,5p' ~/.ssh/aur_ed25519 | sed 's/./*/g'
+            exit 1
+          fi
+          # Start agent & add key
+          eval "$(ssh-agent -s)" >/dev/null
+          ssh-add ~/.ssh/aur_ed25519
+          ssh-add -l || true
+          # Fetch both RSA and ED25519 host keys (AUR currently publishes both)
+          ssh-keyscan -t rsa,ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null || true
+          # Quick auth probe (non-fatal) to surface key issues early
+          if ! GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=yes" git ls-remote "$AUR_REPO_SSH" >/dev/null 2>&1; then
+            echo '::warning::Pre-clone auth test failed; will retry during actual clone.'
+            echo 'Debugging first 20 lines of ssh -vv attempt:'
+            (ssh -vv -o StrictHostKeyChecking=yes aur@aur.archlinux.org 2>&1 | sed -n '1,120p') || true
+          fi
+          # Derive public key & fingerprint (safe to print) for user cross-check with AUR account settings.
+          ssh-keygen -yf ~/.ssh/aur_ed25519 > ~/.ssh/aur_ed25519.pub 2>/dev/null || true
+          echo 'Loaded key fingerprint(s):'
+          ssh-keygen -lf ~/.ssh/aur_ed25519.pub 2>/dev/null || true
+          # Export command for later steps to force this identity only.
+          echo "GIT_SSH_COMMAND=ssh -i ~/.ssh/aur_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" >> "$GITHUB_ENV"
+      
+      - name: Clone AUR repo
+        run: |
+          set -euo pipefail
+          echo "Using enforced SSH command: $GIT_SSH_COMMAND" >&2
+          # Attempt clone with enforced identity
+          if ! git clone "$AUR_REPO_SSH" aur-repo 2>clone.err; then
+            echo '::error::git clone failed. Showing last 60 lines of verbose SSH probe and clone stderr:'
+            tail -n 60 clone.err || true
+            echo 'Likely causes: (1) Public key NOT uploaded to AUR account; (2) Wrong package repo name; (3) Secret contains wrong private key.'
+            exit 128
+          fi
+
+      - name: Check upstream for new commit/version
+        id: upstream
+        run: |
+          set -euo pipefail
+          cd aur-repo
+          if [ ! -f PKGBUILD ]; then
+            echo "PKGBUILD missing in cloned AUR repo" >&2; exit 1; fi
+          current_pkgver=$(grep -E '^pkgver=' PKGBUILD | head -1 | cut -d= -f2- | tr -d ' \t') || current_pkgver=""
+          echo "Current pkgver: $current_pkgver" >&2
+          rm -rf _upstream && git clone --depth=1 "$UPSTREAM_REPO" _upstream >/dev/null 2>&1
+          cd _upstream
+            internal_ver=$(grep -E 'BRIDGE_APP_VERSION\?=' Makefile | sed -E 's/.*= *([^ ]+).*/\1/' || echo unknown)
+            git_rev=$(git rev-parse --short HEAD)
+            new_pkgver="${internal_ver%%+*}.r0.g${git_rev}"
+            echo "Latest upstream derived pkgver: $new_pkgver" >&2
+          cd ..
+          if [ -z "$current_pkgver" ] || [ "$new_pkgver" != "$current_pkgver" ]; then
+            echo "Upstream change detected (or pkgver empty). Updating PKGBUILD..." >&2
+            sed -i -E "s/^pkgver=.*/pkgver=$new_pkgver/" PKGBUILD
+            sed -i -E "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+            upstream_changed=true
+          else
+            upstream_changed=false
+          fi
+          echo "upstream_changed=$upstream_changed" >> $GITHUB_OUTPUT
+          rm -rf _upstream
+          if git diff --quiet; then
+            echo "No modifications to commit yet." >&2
+            echo "files_changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "PKGBUILD updated due to upstream change." >&2
+            echo "files_changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Decide if build/push needed
+        id: decision
+        run: |
+          force_dispatch="${{ github.event.inputs.force || 'false' }}"
+          changed="${{ steps.upstream.outputs.files_changed }}"
+          upstream_changed="${{ steps.upstream.outputs.upstream_changed }}"
+          if [[ "$force_dispatch" == "true" ]]; then
+            echo "Forced run requested." >&2
+            echo "proceed=true" >> $GITHUB_OUTPUT
+          elif [[ "$upstream_changed" == "true" || "$changed" == "true" ]]; then
+            echo "Changes detected (upstream: $upstream_changed, files: $changed), will proceed." >&2
+            echo "proceed=true" >> $GITHUB_OUTPUT
+          else
+            echo "No changes and not forced; skipping build/push." >&2
+            echo "proceed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Prepare artifact for container build
+        if: steps.decision.outputs.proceed == 'true'
+        run: |
+          tar -C aur-repo -czf aur-repo.tar.gz .
+
+      - name: Build & test in Arch container
+        if: steps.decision.outputs.proceed == 'true'
+        id: build
+        uses: addnab/docker-run-action@v3
+        with:
+          image: ${{ env.ARCH_CONTAINER }}
+          options: -v ${{ github.workspace }}:/workspace -w /workspace
+          run: |
+            set -euxo pipefail
+            pacman -Sy --noconfirm git base-devel sudo rsync
+            useradd -m build
+            echo 'build ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/build
+            su build -c 'mkdir -p /home/build/pkgbuild'
+            tar -C /home/build/pkgbuild -xzf aur-repo.tar.gz
+            # Ensure build user owns extracted files so it can generate .SRCINFO and build artifacts
+            chown -R build:build /home/build/pkgbuild
+            cd /home/build/pkgbuild
+            su build -c 'makepkg --printsrcinfo > .SRCINFO'
+            su build -c 'makepkg -sf --noconfirm'
+            pkgfile=( *.pkg.tar.* )
+            if [[ -f "${pkgfile[0]}" ]]; then
+              pacman -U --noconfirm "${pkgfile[0]}"
+            fi
+            if command -v rsync >/dev/null 2>&1; then
+              rsync -a --delete /home/build/pkgbuild/ /workspace/aur-repo/
+            else
+              echo '::warning::rsync missing unexpectedly; falling back to cp'
+              rm -rf /workspace/aur-repo/*
+              cp -a /home/build/pkgbuild/. /workspace/aur-repo/
+            fi
+
+      - name: Fix ownership after container build
+        if: steps.decision.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          # Ensure current runner user owns repo so git can write config/index.
+          sudo chown -R "$USER":"$USER" aur-repo || true
+          # Relax write perms just in case (non-recursive for .git/config only)
+          if [ -f aur-repo/.git/config ]; then sudo chmod u+rw aur-repo/.git/config || true; fi
+
+      - name: Commit & push to AUR
+        if: steps.decision.outputs.proceed == 'true'
+        run: |
+            set -eu
+            cd aur-repo
+            # Mark as safe (in case of uid/gid changes from container operations)
+            git config --global --add safe.directory "$(pwd)" || true
+            # Normalize permissions if still mismatched
+            if [ ! -w .git/config ]; then chmod u+rw .git/config || true; fi
+            git config user.name "${{ github.actor }}"
+            git config user.email "${{ github.actor }}@users.noreply.github.com"
+            if git diff --quiet; then
+              echo "No diff after build (.SRCINFO may match). Nothing to push."; exit 0
+            fi
+            git add .
+            git commit -m "Update packaging (CI run $GITHUB_RUN_NUMBER)" || exit 0
+            git push origin HEAD:master
+
+      - name: Summary
+        run: |
+          echo "Upstream changed: ${{ steps.upstream.outputs.upstream_changed }}"
+          echo "Files changed: ${{ steps.upstream.outputs.files_changed }}"
+          echo "Proceed: ${{ steps.decision.outputs.proceed }}"
+          if [ "${{ steps.decision.outputs.proceed }}" = 'false' ]; then
+            echo "No updates were necessary." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Update attempted (see prior steps for success/push)." >> $GITHUB_STEP_SUMMARY
+          fi
+
