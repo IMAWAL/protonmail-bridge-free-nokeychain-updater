@@ -93,13 +93,12 @@ jobs:
             new_pkgver="${internal_ver%%+*}.r0.g${git_rev}"
             echo "Latest upstream derived pkgver: $new_pkgver" >&2
           cd ..
+          upstream_changed=false
           if [ -z "$current_pkgver" ] || [ "$new_pkgver" != "$current_pkgver" ]; then
             echo "Upstream change detected (or pkgver empty). Updating PKGBUILD..." >&2
             sed -i -E "s/^pkgver=.*/pkgver=$new_pkgver/" PKGBUILD
             sed -i -E "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
             upstream_changed=true
-          else
-            upstream_changed=false
           fi
           echo "upstream_changed=$upstream_changed" >> $GITHUB_OUTPUT
           rm -rf _upstream
