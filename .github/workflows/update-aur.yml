@@ -125,7 +125,9 @@ jobs:
           if [ ! -f PKGBUILD ]; then
             echo "PKGBUILD missing in cloned AUR repo" >&2; exit 1; fi
           current_pkgver=$(grep -E '^pkgver=' PKGBUILD | head -1 | cut -d= -f2- | tr -d ' \t') || current_pkgver=""
+          current_pkgrel=$(grep -E '^pkgrel=' PKGBUILD | head -1 | cut -d= -f2- | tr -d ' \t') || current_pkgrel="0"
           echo "Current pkgver: $current_pkgver" >&2
+          echo "Current pkgrel: $current_pkgrel" >&2
           rm -rf _upstream && git clone --depth=1 "$UPSTREAM_REPO" _upstream >/dev/null 2>&1
           cd _upstream
             internal_ver=$(grep -E 'BRIDGE_APP_VERSION\?=' Makefile | sed -E 's/.*= *([^ ]+).*/\1/' || echo unknown)
@@ -135,10 +137,19 @@ jobs:
           cd ..
           upstream_changed=false
           if [ -z "$current_pkgver" ] || [ "$new_pkgver" != "$current_pkgver" ]; then
+            # If pkgver changed, reset pkgrel to 1
             echo "Upstream change detected (or pkgver empty). Updating PKGBUILD..." >&2
             sed -i -E "s/^pkgver=.*/pkgver=$new_pkgver/" PKGBUILD
             sed -i -E "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
             upstream_changed=true
+          else
+            # If pkgver is the same but we're making other changes, increment pkgrel
+            force_dispatch="${{ github.event.inputs.force || 'false' }}"
+            if [ "$force_dispatch" = "true" ] || [ -f keyfile.patch.new ]; then
+              new_pkgrel=$((current_pkgrel + 1))
+              echo "Incrementing pkgrel to $new_pkgrel..." >&2
+              sed -i -E "s/^pkgrel=.*/pkgrel=$new_pkgrel/" PKGBUILD
+            fi
           fi
           echo "upstream_changed=$upstream_changed" >> $GITHUB_OUTPUT
           rm -rf _upstream
