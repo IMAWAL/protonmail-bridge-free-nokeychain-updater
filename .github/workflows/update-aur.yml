@@ -102,6 +102,16 @@ jobs:
           echo "Clone succeeded." >&2
           echo "clone_ok=true" >> $GITHUB_OUTPUT
 
+      - name: Prevent temporary patch from being staged
+        if: steps.clone.outputs.clone_ok == 'true'
+        run: |
+          set -euo pipefail
+          info_exclude="aur-repo/.git/info/exclude"
+          mkdir -p "$(dirname "$info_exclude")"
+          if ! grep -qxF 'keyfile.patch.new' "$info_exclude" 2>/dev/null; then
+            echo 'keyfile.patch.new' >> "$info_exclude"
+          fi
+
       - name: Fetch latest keyfile.patch from nokeychain AUR repo
         if: steps.clone.outputs.clone_ok == 'true'
         id: fetch_patch
@@ -251,6 +261,8 @@ jobs:
           if [ -f github_output ] && grep -q "files_changed=true" github_output; then
             echo "files_changed=true" >> $GITHUB_OUTPUT
           fi
+          # Ensure temporary patch file never leaks into commits
+          rm -f aur-repo/keyfile.patch.new
 
       - name: Commit & push to AUR
         if: steps.decision.outputs.proceed == 'true'
@@ -259,6 +271,9 @@ jobs:
             cd aur-repo
             # Remove our temporary flag file if it exists
             rm -f .patch_updated
+            # Guard against temporary patch file being staged or committed
+            rm -f keyfile.patch.new
+            git rm --cached --ignore-unmatch keyfile.patch.new
             # Mark as safe (in case of uid/gid changes from container operations)
             git config --global --add safe.directory "$(pwd)" || true
             # Normalize permissions if still mismatched
