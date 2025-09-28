@@ -138,6 +138,15 @@ jobs:
           current_pkgrel=$(grep -E '^pkgrel=' PKGBUILD | head -1 | cut -d= -f2- | tr -d ' \t' || true)
           current_pkgrel=${current_pkgrel:-0}
           current_commit=$(grep -E '^# upstream_commit=' PKGBUILD | head -1 | sed -E 's/^# upstream_commit=//' || true)
+          # Determine if keyfile.patch content changed (presence alone shouldn't bump pkgrel)
+          patch_diff=false
+          if [ -f keyfile.patch.new ]; then
+            if [ ! -f keyfile.patch ]; then
+              patch_diff=true
+            elif ! cmp -s keyfile.patch.new keyfile.patch; then
+              patch_diff=true
+            fi
+          fi
           echo "Current pkgver: ${current_pkgver:-<none>}" >&2
           echo "Current pkgrel: ${current_pkgrel}" >&2
           echo "Current recorded upstream commit: ${current_commit:-<none>}" >&2
@@ -154,7 +163,7 @@ jobs:
           upstream_ver_changed=false
           upstream_commit_changed=false
           pkgrel_modified=false
-          force_dispatch="${{ github.event.inputs.force || 'false' }}"
+          force_dispatch="${{ github.event.inputs.force || 'false' }}"  # Force no longer triggers pkgrel bump directly
           # 1. Version bump (clean version changed)
           if [ -z "${current_pkgver}" ] || [ "${clean_ver}" != "${current_pkgver}" ]; then
             echo "Version change detected (${current_pkgver} -> ${clean_ver}). Resetting pkgrel to 1." >&2
@@ -176,14 +185,12 @@ jobs:
               pkgrel_modified=true
             fi
           fi
-          # 3. Patch update or forced run may still require pkgrel increment if not already modified
-          if [ "${pkgrel_modified}" = "false" ]; then
-            if [ "$force_dispatch" = "true" ] || [ -f keyfile.patch.new ]; then
-              echo "Forcing pkgrel increment due to force flag or patch presence." >&2
-              new_pkgrel=$(( current_pkgrel + 1 ))
-              sed -i -E "s/^pkgrel=.*/pkgrel=${new_pkgrel}/" PKGBUILD
-              pkgrel_modified=true
-            fi
+          # 3. Patch content change (and no upstream changes already) triggers pkgrel increment
+          if [ "${pkgrel_modified}" = "false" ] && [ "${patch_diff}" = "true" ]; then
+            echo "Patch content changed; incrementing pkgrel." >&2
+            new_pkgrel=$(( current_pkgrel + 1 ))
+            sed -i -E "s/^pkgrel=.*/pkgrel=${new_pkgrel}/" PKGBUILD
+            pkgrel_modified=true
           fi
           # 4. Record (or update) upstream commit line so future runs can detect commit changes
           if grep -q '^# upstream_commit=' PKGBUILD; then
@@ -202,8 +209,10 @@ jobs:
           fi
           echo "Upstream version changed: ${upstream_ver_changed}" >&2
           echo "Upstream commit changed: ${upstream_commit_changed}" >&2
+          echo "Patch content changed: ${patch_diff}" >&2
           echo "pkgrel modified in this step: ${pkgrel_modified}" >&2
           echo "upstream_changed=${upstream_changed}" >> $GITHUB_OUTPUT
+          echo "patch_changed=${patch_diff}" >> $GITHUB_OUTPUT
           rm -rf _upstream
           if git diff --quiet; then
             echo "No modifications to commit yet." >&2
@@ -225,12 +234,12 @@ jobs:
           force_dispatch="${{ github.event.inputs.force || 'false' }}"
           changed="${{ steps.upstream.outputs.files_changed }}"
           upstream_changed="${{ steps.upstream.outputs.upstream_changed }}"
-          patch_found="${{ steps.fetch_patch.outputs.patch_found }}"
+          patch_changed="${{ steps.upstream.outputs.patch_changed }}"
           if [[ "$force_dispatch" == "true" ]]; then
             echo "Forced run requested." >&2
             echo "proceed=true" >> $GITHUB_OUTPUT
-          elif [[ "$upstream_changed" == "true" || "$changed" == "true" || "$patch_found" == "true" ]]; then
-            echo "Changes detected (upstream: $upstream_changed, files: $changed, patch found: $patch_found), will proceed." >&2
+          elif [[ "$upstream_changed" == "true" || "$changed" == "true" || "$patch_changed" == "true" ]]; then
+            echo "Changes detected (upstream: $upstream_changed, files: $changed, patch changed: $patch_changed), will proceed." >&2
             echo "proceed=true" >> $GITHUB_OUTPUT
           else
             echo "No changes and not forced; skipping build/push." >&2
@@ -352,6 +361,7 @@ jobs:
           echo "Clone OK: ${{ steps.clone.outputs.clone_ok }}"
           echo "Upstream changed: ${{ steps.upstream.outputs.upstream_changed }}"
           echo "Files changed: ${{ steps.upstream.outputs.files_changed }}"
+          echo "Patch changed: ${{ steps.upstream.outputs.patch_changed }}"
           echo "Proceed: ${{ steps.decision.outputs.proceed }}"
           if [ "${{ steps.decision.outputs.proceed }}" = 'false' ]; then
             if [ "${{ steps.clone.outputs.clone_ok }}" != 'true' ]; then
