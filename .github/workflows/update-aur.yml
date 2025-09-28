@@ -268,11 +268,12 @@ jobs:
               mv keyfile.patch.new keyfile.patch
               # Update checksums
               su build -c 'updpkgsums'
-              su build -c 'makepkg --printsrcinfo > .SRCINFO'
               patch_changed="true"
               # Create a flag file to indicate changes
               touch .patch_updated
             fi
+            # Always regenerate .SRCINFO (pkgver/pkgrel or other metadata may have changed in PKGBUILD)
+            su build -c 'makepkg --printsrcinfo > .SRCINFO'
             su build -c 'makepkg -sf --noconfirm'
             pkgfile=( *.pkg.tar.* )
             if [[ -f "${pkgfile[0]}" ]]; then
